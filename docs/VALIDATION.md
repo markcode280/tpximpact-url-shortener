@@ -23,8 +23,14 @@ The first frontend baseline failed because the table component was absent and cl
 
 Environment: macOS ARM64, .NET SDK 8.0.427, Node 24.22.0, Chrome, SQLite. Browser testing used an isolated temporary SQLite database, not personal data.
 
-## Remaining verification limitation
+## Hosted verification
 
-Docker Engine/Desktop is not installed on the test machine. The Dockerfiles and Compose file have been reviewed and the Compose YAML parsed, but **the container images have not been built or run locally**. The included CI workflow runs `docker compose up --build --detach --wait` and the smoke script on a Docker-enabled runner. A hosted workflow run is still pending.
+[GitHub Actions run 40869815078](https://github.com/markcode280/tpximpact-url-shortener/actions/runs/40869815078) passed for implementation commit `f2b661d4f04e43ec2d3a7ffd02fb08bbbf7a5531` on 29 October 2026.
 
-The local browser and smoke tests validate the application and Vite proxy, not the Nginx image or its filesystem permissions. Run the documented Docker command before treating container verification as complete.
+| Job | Result |
+| --- | --- |
+| Backend | Release .NET test suite passed |
+| Frontend | Clean dependency installation, tests, TypeScript check and production build passed |
+| Containers | Both images built, Compose services became healthy, and the HTTP smoke test passed through Nginx |
+
+The container job ran `docker compose up --build --detach --wait`, followed by `bash scripts/smoke-test.sh`. It checked creation, listing, redirect and persistent deletion against the assembled application. Docker was unavailable on the local Mac, so this check ran on a GitHub-hosted Linux runner instead.

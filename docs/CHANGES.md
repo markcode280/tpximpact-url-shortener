@@ -27,7 +27,7 @@ Docker Compose starts the API and Nginx frontend, waits for health checks and pe
 
 The backend tests use SQLite to exercise persistence and unique constraints. Frontend tests cover forms, list rendering, paging, retries, failed mutations and stale responses. Incorrect expectations in the supplied tests were corrected against the documented HTTP contract.
 
-Dependency updates address the vulnerabilities reported by npm and NuGet while retaining .NET 8 and React 18. See [validation results](VALIDATION.md) for the recorded checks, including the outstanding Docker run.
+Dependency updates address the vulnerabilities reported by npm and NuGet while retaining .NET 8 and React 18. See [validation results](VALIDATION.md) for the local checks and successful Docker verification on GitHub Actions.
 
 ## Scope
 
