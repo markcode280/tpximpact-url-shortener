@@ -35,16 +35,17 @@ describe('api service', () => {
       .rejects.toThrow('Alias already taken.');
   });
 
-  it('listAll sends GET to /urls', async () => {
+  it('list sends paging parameters and cancellation signal', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
-      json: async () => [],
+      json: async () => ({ items: [], page: 2, pageSize: 10, totalCount: 0, totalPages: 0 }),
     } as Response);
 
-    await api.listAll();
+    const controller = new AbortController();
+    await api.list(2, 10, controller.signal);
 
-    expect(fetch).toHaveBeenCalledWith('/urls');
+    expect(fetch).toHaveBeenCalledWith('/urls?page=2&pageSize=10', { signal: controller.signal });
   });
 
   it('delete sends DELETE to /{alias}', async () => {

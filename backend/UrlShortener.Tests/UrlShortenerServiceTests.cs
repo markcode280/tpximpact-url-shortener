@@ -1,5 +1,8 @@
 using FluentAssertions;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+using Moq;
 using UrlShortener.Api.Data;
 using UrlShortener.Api.Models;
 using UrlShortener.Api.Services;
@@ -9,173 +12,181 @@ namespace UrlShortener.Tests;
 
 public class UrlShortenerServiceTests : IDisposable
 {
+    private readonly SqliteConnection _connection = new("Data Source=:memory:");
     private readonly AppDbContext _db;
     private readonly UrlShortenerService _sut;
     private const string BaseUrl = "http://localhost:8080";
 
     public UrlShortenerServiceTests()
     {
-        var options = new DbContextOptionsBuilder<AppDbContext>()
-            .UseInMemoryDatabase(Guid.NewGuid().ToString())
-            .Options;
-        _db = new AppDbContext(options);
-        _sut = new UrlShortenerService(_db);
+        _connection.Open();
+        _db = new AppDbContext(new DbContextOptionsBuilder<AppDbContext>().UseSqlite(_connection).Options);
+        _db.Database.EnsureCreated();
+        _sut = new UrlShortenerService(_db, new RandomAliasGenerator());
     }
 
-    public void Dispose() => _db.Dispose();
-
-    // --- ShortenAsync ---
+    public void Dispose() { _db.Dispose(); _connection.Dispose(); }
 
     [Fact]
-    public async Task ShortenAsync_WithValidUrl_ReturnsShortUrl()
+    public async Task Shorten_GeneratesValidAliasAndPersistsDestination()
     {
-        var request = new ShortenUrlRequest { FullUrl = "https://example.com/very/long/path" };
-
-        var result = await _sut.ShortenAsync(request, BaseUrl);
-
-        result.ShortUrl.Should().StartWith(BaseUrl + "/");
-        result.FullUrl.Should().Be(request.FullUrl);
-        result.Alias.Should().NotBeNullOrWhiteSpace();
+        var result = await _sut.ShortenAsync(new() { FullUrl = "https://example.com/path" }, BaseUrl);
+        result.Alias.Should().MatchRegex("^[a-zA-Z0-9]{8}$");
+        result.ShortUrl.Should().Be($"{BaseUrl}/{result.Alias}");
+        _db.ChangeTracker.Clear();
+        (await _sut.GetFullUrlAsync(result.Alias)).Should().Be("https://example.com/path");
     }
 
     [Fact]
-    public async Task ShortenAsync_WithCustomAlias_UsesProvidedAlias()
+    public async Task Shorten_TrimsCustomAliasAndDestination()
     {
-        var request = new ShortenUrlRequest
-        {
-            FullUrl = "https://example.com",
-            CustomAlias = "my-alias"
-        };
-
-        var result = await _sut.ShortenAsync(request, BaseUrl);
-
+        var result = await _sut.ShortenAsync(new()
+            { FullUrl = " https://example.com ", CustomAlias = " my-alias " }, BaseUrl + "/");
         result.Alias.Should().Be("my-alias");
+        result.FullUrl.Should().Be("https://example.com");
         result.ShortUrl.Should().Be($"{BaseUrl}/my-alias");
     }
 
-    [Fact]
-    public async Task ShortenAsync_WithDuplicateAlias_ThrowsInvalidOperationException()
+    [Theory]
+    [InlineData("a")]
+    [InlineData("bad alias")]
+    [InlineData("bad/alias")]
+    [InlineData("éclair")]
+    [InlineData("urls")]
+    [InlineData("SHORTEN")]
+    [InlineData("health")]
+    [InlineData("swagger")]
+    [InlineData("assets")]
+    [InlineData("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")]
+    public async Task Shorten_RejectsMalformedOrReservedAliases(string alias)
     {
-        var request = new ShortenUrlRequest
-        {
-            FullUrl = "https://example.com",
-            CustomAlias = "duplicate"
-        };
-        await _sut.ShortenAsync(request, BaseUrl);
-
-        var secondRequest = new ShortenUrlRequest
-        {
-            FullUrl = "https://another.com",
-            CustomAlias = "duplicate"
-        };
-
-        await _sut.Invoking(s => s.ShortenAsync(secondRequest, BaseUrl))
-            .Should().ThrowAsync<InvalidOperationException>()
-            .WithMessage("*duplicate*");
+        await _sut.Invoking(s => s.ShortenAsync(new() { FullUrl = "https://example.com", CustomAlias = alias }, BaseUrl))
+            .Should().ThrowAsync<ArgumentException>();
     }
 
     [Theory]
-    [InlineData("a")]          // too short (1 char)
-    [InlineData("this-alias-is-way-too-long-to-be-accepted-by-the-service-because-it-exceeds-64-characters")]
-    [InlineData("bad alias")]  // contains space
-    [InlineData("bad/alias")]  // contains slash
-    public async Task ShortenAsync_WithInvalidAlias_ThrowsArgumentException(string alias)
+    [InlineData("not-a-url")]
+    [InlineData("javascript:alert(1)")]
+    [InlineData("ftp://example.com/file")]
+    [InlineData("https://user:password@example.com")]
+    [InlineData("")]
+    public async Task Shorten_RejectsInvalidDestination(string url)
     {
-        var request = new ShortenUrlRequest
-        {
-            FullUrl = "https://example.com",
-            CustomAlias = alias
-        };
-
-        await _sut.Invoking(s => s.ShortenAsync(request, BaseUrl))
+        await _sut.Invoking(s => s.ShortenAsync(new() { FullUrl = url }, BaseUrl))
             .Should().ThrowAsync<ArgumentException>();
     }
 
     [Fact]
-    public async Task ShortenAsync_GeneratesUniqueAliasEachTime()
+    public async Task Shorten_DuplicateCustomAliasDoesNotOverwriteOriginal()
     {
-        var r1 = await _sut.ShortenAsync(new ShortenUrlRequest { FullUrl = "https://one.com" }, BaseUrl);
-        var r2 = await _sut.ShortenAsync(new ShortenUrlRequest { FullUrl = "https://two.com" }, BaseUrl);
-
-        r1.Alias.Should().NotBe(r2.Alias);
+        await _sut.ShortenAsync(new() { FullUrl = "https://first.com", CustomAlias = "same" }, BaseUrl);
+        await _sut.Invoking(s => s.ShortenAsync(new() { FullUrl = "https://other.com", CustomAlias = "same" }, BaseUrl))
+            .Should().ThrowAsync<AliasConflictException>();
+        (await _sut.GetFullUrlAsync("same")).Should().Be("https://first.com");
     }
 
-    // --- GetFullUrlAsync ---
+    [Fact]
+    public async Task Shorten_RetriesGeneratedAliasCollision()
+    {
+        await _sut.ShortenAsync(new() { FullUrl = "https://first.com", CustomAlias = "taken" }, BaseUrl);
+        var generator = new Mock<IAliasGenerator>();
+        generator.SetupSequence(g => g.GenerateAlias()).Returns("taken").Returns("available");
+        var service = new UrlShortenerService(_db, generator.Object);
+        (await service.ShortenAsync(new() { FullUrl = "https://new.com" }, BaseUrl)).Alias.Should().Be("available");
+        generator.Verify(g => g.GenerateAlias(), Times.Exactly(2));
+    }
 
     [Fact]
-    public async Task GetFullUrlAsync_WithExistingAlias_ReturnsFullUrl()
+    public async Task Shorten_BoundsCollisionRetries()
     {
-        await _sut.ShortenAsync(new ShortenUrlRequest
+        await _sut.ShortenAsync(new() { FullUrl = "https://first.com", CustomAlias = "taken" }, BaseUrl);
+        var generator = new Mock<IAliasGenerator>();
+        generator.Setup(g => g.GenerateAlias()).Returns("taken");
+        var service = new UrlShortenerService(_db, generator.Object);
+        await service.Invoking(s => s.ShortenAsync(new() { FullUrl = "https://new.com" }, BaseUrl))
+            .Should().ThrowAsync<AliasGenerationException>();
+        generator.Verify(g => g.GenerateAlias(), Times.Exactly(5));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Shorten_HandlesUniqueConstraintRaceAtSave(bool customAlias)
+    {
+        await using var raceDb = new AppDbContext(new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(_connection).AddInterceptors(new InsertCompetingAlias()).Options);
+        var generator = new Mock<IAliasGenerator>();
+        generator.SetupSequence(g => g.GenerateAlias()).Returns("racealias").Returns("nextalias");
+        var service = new UrlShortenerService(raceDb, generator.Object);
+        var request = new ShortenUrlRequest { FullUrl = "https://new.com", CustomAlias = customAlias ? "racealias" : null };
+        if (customAlias)
+            await service.Invoking(s => s.ShortenAsync(request, BaseUrl)).Should().ThrowAsync<AliasConflictException>();
+        else
+            (await service.ShortenAsync(request, BaseUrl)).Alias.Should().Be("nextalias");
+        (await _sut.GetFullUrlAsync("racealias")).Should().Be("https://competitor.com");
+    }
+
+    [Fact]
+    public async Task GetPage_OrdersNewestFirstAndBreaksTiesById()
+    {
+        var timestamp = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        _db.ShortenedUrls.AddRange(
+            new ShortenedUrl { Alias = "old", FullUrl = "https://old.com", CreatedAt = timestamp.AddDays(-1) },
+            new ShortenedUrl { Alias = "middle", FullUrl = "https://middle.com", CreatedAt = timestamp },
+            new ShortenedUrl { Alias = "new", FullUrl = "https://new.com", CreatedAt = timestamp });
+        await _db.SaveChangesAsync();
+        var first = await _sut.GetPageAsync(BaseUrl, 1, 2);
+        var second = await _sut.GetPageAsync(BaseUrl, 2, 2);
+        first.Items.Select(i => i.Alias).Should().Equal("new", "middle");
+        second.Items.Select(i => i.Alias).Should().Equal("old");
+        first.TotalCount.Should().Be(3);
+        first.TotalPages.Should().Be(2);
+        first.Items[0].CreatedAt.Should().Be(timestamp);
+        first.Items[0].ShortUrl.Should().Be($"{BaseUrl}/new");
+    }
+
+    [Fact]
+    public async Task GetPage_EmptyAndOutOfRangePagesHaveConsistentMetadata()
+    {
+        var result = await _sut.GetPageAsync(BaseUrl, 3, 10);
+        result.Items.Should().BeEmpty();
+        result.Page.Should().Be(3);
+        result.TotalCount.Should().Be(0);
+        result.TotalPages.Should().Be(0);
+    }
+
+    [Theory]
+    [InlineData(0, 10)]
+    [InlineData(-1, 10)]
+    [InlineData(1, 0)]
+    [InlineData(1, 101)]
+    [InlineData(int.MaxValue, 100)]
+    public async Task GetPage_RejectsInvalidAndOverflowingPagination(int page, int pageSize)
+    {
+        await _sut.Invoking(s => s.GetPageAsync(BaseUrl, page, pageSize)).Should().ThrowAsync<ArgumentException>();
+    }
+
+    [Fact]
+    public async Task Delete_PersistsRemovalAcrossContexts()
+    {
+        await _sut.ShortenAsync(new() { FullUrl = "https://example.com", CustomAlias = "delete-me" }, BaseUrl);
+        (await _sut.DeleteAsync("delete-me")).Should().BeTrue();
+        await using var freshDb = new AppDbContext(new DbContextOptionsBuilder<AppDbContext>().UseSqlite(_connection).Options);
+        (await freshDb.ShortenedUrls.AnyAsync(u => u.Alias == "delete-me")).Should().BeFalse();
+        (await _sut.DeleteAsync("delete-me")).Should().BeFalse();
+    }
+
+    private sealed class InsertCompetingAlias : SaveChangesInterceptor
+    {
+        public override async ValueTask<InterceptionResult<int>> SavingChangesAsync(
+            DbContextEventData eventData, InterceptionResult<int> result, CancellationToken cancellationToken = default)
         {
-            FullUrl = "https://example.com",
-            CustomAlias = "test-alias"
-        }, BaseUrl);
-
-        var result =  _sut.GetFullUrlAsync("test-alias").GetAwaiter().GetResult();
-
-        result.Should().Be("https://example.com");
-    }
-
-    [Fact]
-    public async Task GetFullUrlAsync_WithUnknownAlias_ReturnsNull()
-    {
-        var result = await _sut.GetFullUrlAsync("nonexistent");
-
-        result.Should().BeNull();
-    }
-
-    // --- GetAllAsync ---
-
-    [Fact]
-    public async Task GetAllAsync_ReturnsAllUrls()
-    {
-        await _sut.ShortenAsync(new ShortenUrlRequest { FullUrl = "https://one.com", CustomAlias = "one" }, BaseUrl);
-        await _sut.ShortenAsync(new ShortenUrlRequest { FullUrl = "https://two.com", CustomAlias = "two" }, BaseUrl);
-
-        var results = (await _sut.GetAllAsync(BaseUrl)).ToList();
-
-        results.Should().HaveCount(2);
-        results.Should().Contain(r => r.Alias == "one");
-        results.Should().Contain(r => r.Alias == "two");
-    }
-
-    [Fact]
-    public async Task GetAllAsync_EachItemHasCorrectShortUrl()
-    {
-        await _sut.ShortenAsync(new ShortenUrlRequest { FullUrl = "https://example.com", CustomAlias = "abc" }, BaseUrl);
-
-        var results = (await _sut.GetAllAsync(BaseUrl)).ToList();
-
-        results.Single().ShortUrl.Should().Be($"{BaseUrl}/abc");
-    }
-
-    [Fact]
-    public async Task GetAllAsync_WhenEmpty_ReturnsEmptyList()
-    {
-        var results = await _sut.GetAllAsync(BaseUrl);
-
-        results.Should().BeEmpty();
-    }
-
-    // --- DeleteAsync ---
-
-    [Fact]
-    public async Task DeleteAsync_WithExistingAlias_ReturnsTrueAndRemovesEntry()
-    {
-        await _sut.ShortenAsync(new ShortenUrlRequest { FullUrl = "https://example.com", CustomAlias = "to-delete" }, BaseUrl);
-
-        var deleted = await _sut.DeleteAsync("to-delete");
-        var afterDelete = await _sut.GetFullUrlAsync("to-delete");
-
-        deleted.Should().BeTrue();
-        afterDelete.Should().BeNull();
-    }
-
-    [Fact]
-    public async Task DeleteAsync_WithUnknownAlias_ReturnsFalse()
-    {
-        var result = await _sut.DeleteAsync("ghost");
-
-        result.Should().BeFalse();
+            var db = eventData.Context!;
+            if (db.ChangeTracker.Entries<ShortenedUrl>().Any(e => e.State == EntityState.Added && e.Entity.Alias == "racealias"))
+                await db.Database.ExecuteSqlInterpolatedAsync(
+                    $"INSERT INTO ShortenedUrls (Alias, FullUrl, CreatedAt) VALUES ({"racealias"}, {"https://competitor.com"}, {DateTime.UtcNow})",
+                    cancellationToken);
+            return result;
+        }
     }
 }

@@ -1,102 +1,94 @@
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using UrlShortener.Api.Data;
 using UrlShortener.Api.Models;
 
 namespace UrlShortener.Api.Services;
 
-public class UrlShortenerService : IUrlShortenerService
+public class UrlShortenerService(AppDbContext db, IAliasGenerator aliasGenerator) : IUrlShortenerService
 {
-    private readonly AppDbContext _db;
+    private const int MaxAliasAttempts = 5;
+    private static readonly HashSet<string> ReservedAliases =
+        new(StringComparer.OrdinalIgnoreCase) { "urls", "shorten", "health", "swagger", "assets" };
 
-    public UrlShortenerService(AppDbContext db)
+    public async Task<ShortenUrlResponse> ShortenAsync(
+        ShortenUrlRequest request, string baseUrl, CancellationToken cancellationToken = default)
     {
-        _db = db;
-    }
+        var fullUrl = request.FullUrl.Trim();
+        if (fullUrl.Length > 2048 ||
+            !Uri.TryCreate(fullUrl, UriKind.Absolute, out var destination) ||
+            (destination.Scheme != Uri.UriSchemeHttp && destination.Scheme != Uri.UriSchemeHttps) ||
+            string.IsNullOrEmpty(destination.Host) || !string.IsNullOrEmpty(destination.UserInfo))
+            throw new ArgumentException("fullUrl must be an absolute HTTP or HTTPS URL without credentials (maximum 2048 characters).");
 
-    public async Task<ShortenUrlResponse> ShortenAsync(ShortenUrlRequest request, string baseUrl)
-    {
-        var alias = string.IsNullOrWhiteSpace(request.CustomAlias)
-            ? GenerateAlias()
-            : request.CustomAlias.Trim();
+        var customAlias = string.IsNullOrWhiteSpace(request.CustomAlias) ? null : request.CustomAlias.Trim();
+        if (customAlias is not null && !IsValidAlias(customAlias))
+            throw new ArgumentException("Alias may only contain ASCII letters, numbers, and hyphens (2–64 characters).");
+        if (customAlias is not null && ReservedAliases.Contains(customAlias))
+            throw new ArgumentException("This alias is reserved for an application route.");
 
-        if (!IsThisThingValidOrNot(alias))
-            throw new ArgumentException("Alias may only contain letters, numbers, and hyphens (2–64 characters).");
-
-        var exists = await _db.ShortenedUrls.AnyAsync(u => u.Alias == alias);
-        if (exists)
-            throw new InvalidOperationException($"The alias '{alias}' is already taken.");
-
-        var entry = new ShortenedUrl
+        for (var attempt = 0; attempt < MaxAliasAttempts; attempt++)
         {
-            Alias = alias,
-            FullUrl = request.FullUrl
-        };
+            var alias = customAlias ?? aliasGenerator.GenerateAlias();
+            if (ReservedAliases.Contains(alias) || await db.ShortenedUrls.AnyAsync(u => u.Alias == alias, cancellationToken))
+            {
+                if (customAlias is not null) throw new AliasConflictException(alias);
+                continue;
+            }
 
-        _db.ShortenedUrls.Add(entry);
-        await _db.SaveChangesAsync();
+            var entry = new ShortenedUrl { Alias = alias, FullUrl = fullUrl };
+            db.ShortenedUrls.Add(entry);
+            try
+            {
+                await db.SaveChangesAsync(cancellationToken);
+                return new ShortenUrlResponse
+                {
+                    Alias = alias, FullUrl = fullUrl, ShortUrl = $"{baseUrl.TrimEnd('/')}/{alias}"
+                };
+            }
+            catch (DbUpdateException ex) when (ex.InnerException is SqliteException { SqliteExtendedErrorCode: 2067 })
+            {
+                // The unique index is authoritative when concurrent requests select the same alias.
+                db.Entry(entry).State = EntityState.Detached;
+                if (customAlias is not null) throw new AliasConflictException(alias);
+            }
+        }
 
-        return new ShortenUrlResponse
-        {
-            Alias = alias,
-            FullUrl = request.FullUrl,
-            ShortUrl = $"{baseUrl}/{alias}"
-        };
+        throw new AliasGenerationException();
     }
 
-    public async Task<string?> GetFullUrlAsync(string alias)
-    {
-        var entry = await _db.ShortenedUrls
-            .AsNoTracking()
-            .FirstOrDefaultAsync(u => u.Alias == alias);
+    public Task<string?> GetFullUrlAsync(string alias, CancellationToken cancellationToken = default) =>
+        db.ShortenedUrls.AsNoTracking().Where(u => u.Alias == alias)
+            .Select(u => u.FullUrl).FirstOrDefaultAsync(cancellationToken);
 
-        return entry?.FullUrl;
-    }
-
-    public async Task<IEnumerable<UrlListItem>> GetAllAsync(string baseUrl)
+    public async Task<PagedUrls> GetPageAsync(
+        string baseUrl, int page = 1, int pageSize = 10, CancellationToken cancellationToken = default)
     {
-        return await _db.ShortenedUrls
-            .AsNoTracking()
-            .OrderByDescending(u => u.CreatedAt)
+        if (page < 1 || pageSize is < 1 or > 100 || (long)(page - 1) * pageSize > int.MaxValue)
+            throw new ArgumentException("page must be positive and within range; pageSize must be between 1 and 100.");
+
+        var query = db.ShortenedUrls.AsNoTracking();
+        var totalCount = await query.CountAsync(cancellationToken);
+        var items = await query.OrderByDescending(u => u.CreatedAt).ThenByDescending(u => u.Id)
+            .Skip((page - 1) * pageSize).Take(pageSize)
             .Select(u => new UrlListItem
             {
-                Alias = u.Alias,
-                FullUrl = u.FullUrl,
-                ShortUrl = $"{baseUrl}/{u.Alias}"
-            })
-            .ToListAsync();
+                Alias = u.Alias, FullUrl = u.FullUrl,
+                ShortUrl = $"{baseUrl.TrimEnd('/')}/{u.Alias}", CreatedAt = u.CreatedAt
+            }).ToListAsync(cancellationToken);
+
+        return new PagedUrls(items, page, pageSize, totalCount);
     }
 
-    public async Task<bool> DeleteAsync(string alias)
+    public async Task<bool> DeleteAsync(string alias, CancellationToken cancellationToken = default)
     {
-        //method to delete a shortened url from the database based on the alias provided. It returns true if the deletion was successful, and false if no entry was found for the given alias.
-        // It first queries the database for an entry with the specified alias. If found, it removes the entry and saves the changes to the database. If not found, it simply returns false.
-        // The method uses asynchronous operations to ensure non-blocking database access, which is important for scalability and performance in web applications.
-        // The use of AsNoTracking in the GetFullUrlAsync and GetAllAsync methods improves performance for read-only queries by not tracking the returned entities in the DbContext's change tracker.
-        // The GenerateAlias and IsValidAlias methods are placeholders for the logic to generate a unique alias and validate the alias format, respectively. The actual implementation of these methods would depend on the specific requirements of the URL shortening service.
-        
-        ShortenedUrl entry = await _db.ShortenedUrls.FirstOrDefaultAsync(u => u.Alias == alias);
-        if (entry is null)
-            return false;
-
-        _db.SaveChangesAsync();
-        _db.ShortenedUrls.Remove(entry);
-       
-     
+        var entry = await db.ShortenedUrls.FirstOrDefaultAsync(u => u.Alias == alias, cancellationToken);
+        if (entry is null) return false;
+        db.ShortenedUrls.Remove(entry);
+        await db.SaveChangesAsync(cancellationToken);
         return true;
     }
 
-    // --- Private helpers ---
-
-    private static string GenerateAlias()
-    {
-        return new string(""); // Placeholder for alias generation logic
-    }
-
-    private static bool IsThisThingValidOrNot(string alias)
-    {
-        if (alias.Length < 2 || alias.Length > 64)
-            return false;
-
-        return alias.All(c => char.IsLetterOrDigit(c) || c == '-');
-    }
+    private static bool IsValidAlias(string alias) =>
+        alias.Length is >= 2 and <= 64 && alias.All(c => char.IsAsciiLetterOrDigit(c) || c == '-');
 }

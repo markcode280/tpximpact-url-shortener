@@ -13,6 +13,15 @@ export interface UrlListItem {
   alias: string;
   fullUrl: string;
   shortUrl: string;
+  createdAt: string;
+}
+
+export interface PagedUrls {
+  items: UrlListItem[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+  totalPages: number;
 }
 
 export interface ApiError {

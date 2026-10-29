@@ -5,191 +5,128 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using UrlShortener.Api.Data;
 using UrlShortener.Api.Models;
 using Xunit;
 
 namespace UrlShortener.Tests;
 
-public class UrlsControllerIntegrationTests : IClassFixture<WebApplicationFactory<Program>>
+public class UrlsControllerIntegrationTests : IDisposable
 {
+    private readonly SqliteConnection _connection = new("Data Source=:memory:");
     private readonly WebApplicationFactory<Program> _factory;
+    private readonly HttpClient _client;
 
-    public UrlsControllerIntegrationTests(WebApplicationFactory<Program> factory)
+    public UrlsControllerIntegrationTests()
     {
-        _factory = factory.WithWebHostBuilder(builder =>
-        {
+        _connection.Open();
+        _factory = new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
             builder.ConfigureServices(services =>
             {
-                var descriptor = services.SingleOrDefault(
-                    d => d.ServiceType == typeof(DbContextOptions<AppDbContext>));
-                if (descriptor != null)
-                    services.Remove(descriptor);
-
-                var connection = new SqliteConnection("Data Source=:memory:");
-                connection.Open();
-
-                services.AddSingleton(connection);
-                services.AddDbContext<AppDbContext>((sp, options) =>
-                {
-                    var sqliteConnection = sp.GetRequiredService<SqliteConnection>();
-                    options.UseSqlite(sqliteConnection);
-                });
-
-                var serviceProvider = services.BuildServiceProvider();
-                using var scope = serviceProvider.CreateScope();
-                var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-                db.Database.EnsureCreated();
-            });
-        });
+                services.RemoveAll<DbContextOptions<AppDbContext>>();
+                services.AddDbContext<AppDbContext>(options => options.UseSqlite(_connection));
+            }));
+        _client = _factory.CreateClient(new() { AllowAutoRedirect = false });
     }
 
-    private HttpClient CreateClient() => _factory.CreateClient(
-        new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
+    public void Dispose() { _client.Dispose(); _factory.Dispose(); _connection.Dispose(); }
 
-    // --- POST /shorten ---
-
-    [Fact]
-    public async Task Post_Shorten_ValidRequest_Returns201WithShortUrl()
+    [Theory]
+    [InlineData(null)]
+    [InlineData("my-alias")]
+    public async Task Create_List_Redirect_Delete_IsPersistent(string? alias)
     {
-        var client = CreateClient();
+        var create = await _client.PostAsJsonAsync("/shorten", new { fullUrl = "https://example.com/path", customAlias = alias });
+        create.StatusCode.Should().Be(HttpStatusCode.Created);
+        var body = (await create.Content.ReadFromJsonAsync<ShortenUrlResponse>())!;
+        create.Headers.Location!.ToString().Should().Be(body.ShortUrl);
+        if (alias is not null) body.Alias.Should().Be(alias);
 
-        var response = await client.PostAsJsonAsync("/shorten", new
-        {
-            fullUrl = "https://example.com/some/path"
-        });
+        var page = (await _client.GetFromJsonAsync<PagedUrls>("/urls"))!;
+        page.Items.Single().Alias.Should().Be(body.Alias);
+        page.TotalCount.Should().Be(1);
+        page.PageSize.Should().Be(10);
 
-        if(!response.IsSuccessStatusCode)
-        {
-            var errorContent = await response.Content.ReadAsStringAsync();
-            throw new Exception($"Request failed with status code {response.StatusCode}: {errorContent}");
-        }
-        //response.StatusCode.Should().Be(HttpStatusCode.Created);
-        var body = await response.Content.ReadFromJsonAsync<ShortenUrlResponse>();
-        body!.ShortUrl.Should().Contain("/");
-        body.FullUrl.Should().Be("https://example.com/some/path");
+        var redirect = await _client.GetAsync($"/{body.Alias}");
+        redirect.StatusCode.Should().Be(HttpStatusCode.Found);
+        redirect.Headers.Location!.ToString().Should().Be("https://example.com/path");
+
+        (await _client.DeleteAsync($"/{body.Alias}")).StatusCode.Should().Be(HttpStatusCode.NoContent);
+        // Each HTTP request uses a fresh scoped DbContext, proving deletion was saved.
+        (await _client.GetAsync($"/{body.Alias}")).StatusCode.Should().Be(HttpStatusCode.NotFound);
+        (await _client.GetFromJsonAsync<PagedUrls>("/urls"))!.TotalCount.Should().Be(0);
+        (await _client.DeleteAsync($"/{body.Alias}")).StatusCode.Should().Be(HttpStatusCode.NotFound);
     }
 
     [Fact]
-    public async Task Post_Shorten_WithCustomAlias_ReturnsAliasInResponse()
+    public async Task DuplicateAlias_Returns400WithoutOverwriting()
     {
-        var client = CreateClient();
-
-        var response = await client.PostAsJsonAsync("/shorten", new
-        {
-            fullUrl = "https://example.com",
-            customAlias = "my-alias"
-        });
-
-        response.StatusCode.Should().Be(HttpStatusCode.Created);
-        var body = await response.Content.ReadFromJsonAsync<ShortenUrlResponse>();
-        body!.Alias.Should().Be("my-alias");
-    }
-
-    [Fact]
-    public async Task Post_Shorten_DuplicateAlias_Returns400()
-    {
-        var client = CreateClient();
-
-        await client.PostAsJsonAsync("/shorten", new { fullUrl = "https://a.com", customAlias = "clash" });
-        var response = await client.PostAsJsonAsync("/shorten", new { fullUrl = "https://b.com", customAlias = "clash" });
-
+        await _client.PostAsJsonAsync("/shorten", new { fullUrl = "https://first.com", customAlias = "same" });
+        var response = await _client.PostAsJsonAsync("/shorten", new { fullUrl = "https://other.com", customAlias = "same" });
         response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        (await response.Content.ReadAsStringAsync()).Should().Contain("already taken");
     }
 
-    [Fact]
-    public async Task Post_Shorten_MissingFullUrl_Returns400()
+    [Theory]
+    [InlineData("not-a-url")]
+    [InlineData("ftp://example.com/file")]
+    [InlineData("javascript:alert(1)")]
+    [InlineData("https://user:password@example.com")]
+    public async Task InvalidDestination_Returns400WithReadableError(string url)
     {
-        var client = CreateClient();
-
-        var response = await client.PostAsJsonAsync("/shorten", new { customAlias = "abc" });
-
+        var response = await _client.PostAsJsonAsync("/shorten", new { fullUrl = url });
         response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        (await response.Content.ReadFromJsonAsync<Dictionary<string, string>>())!["error"].Should().NotBeNullOrWhiteSpace();
     }
 
     [Fact]
-    public async Task Post_Shorten_InvalidUrl_Returns400()
+    public async Task MissingDestination_Returns400()
     {
-        var client = CreateClient();
-
-        var response = await client.PostAsJsonAsync("/shorten", new { fullUrl = "not-a-url" });
-
-        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        (await _client.PostAsJsonAsync("/shorten", new { customAlias = "alias" }))
+            .StatusCode.Should().Be(HttpStatusCode.BadRequest);
     }
 
-    // --- GET /{alias} (redirect) ---
-
-    [Fact]
-    public async Task Get_Alias_ExistingAlias_Returns302WithLocation()
+    [Theory]
+    [InlineData("a")]
+    [InlineData("bad alias")]
+    [InlineData("urls")]
+    [InlineData("HEALTH")]
+    public async Task InvalidAlias_Returns400(string alias)
     {
-        var client = CreateClient();
-        await client.PostAsJsonAsync("/shorten", new { fullUrl = "https://target.com", customAlias = "redir" });
-
-        var response = await client.GetAsync("/redir");
-
-        response.StatusCode.Should().Be(HttpStatusCode.PermanentRedirect);
-        response.Headers.Location!.ToString().Should().Be("https://target.com/");
+        (await _client.PostAsJsonAsync("/shorten", new { fullUrl = "https://example.com", customAlias = alias }))
+            .StatusCode.Should().Be(HttpStatusCode.BadRequest);
     }
 
     [Fact]
-    public async Task Get_Alias_UnknownAlias_Returns404()
+    public async Task List_PaginatesWithoutOverlappingPages()
     {
-        var client = CreateClient();
-
-        var response = await client.GetAsync("/unknown-alias-xyz");
-
-        response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+        for (var i = 0; i < 3; i++)
+            await _client.PostAsJsonAsync("/shorten", new { fullUrl = "https://example.com", customAlias = $"alias-{i}" });
+        var first = (await _client.GetFromJsonAsync<PagedUrls>("/urls?page=1&pageSize=2"))!;
+        var second = (await _client.GetFromJsonAsync<PagedUrls>("/urls?page=2&pageSize=2"))!;
+        first.Items.Select(u => u.Alias).Should().Equal("alias-2", "alias-1");
+        second.Items.Select(u => u.Alias).Should().Equal("alias-0");
+        second.TotalCount.Should().Be(3);
+        second.TotalPages.Should().Be(2);
+        (await _client.GetFromJsonAsync<PagedUrls>("/urls?page=99&pageSize=2"))!.Items.Should().BeEmpty();
     }
 
-    // --- GET /urls ---
-
-    [Fact]
-    public async Task Get_Urls_ReturnsAllShortenedUrls()
+    [Theory]
+    [InlineData("page=0")]
+    [InlineData("page=-1")]
+    [InlineData("page=abc")]
+    [InlineData("pageSize=0")]
+    [InlineData("pageSize=101")]
+    [InlineData("page=2147483647&pageSize=100")]
+    public async Task InvalidPagination_Returns400(string query)
     {
-        var client = CreateClient();
-        await client.PostAsJsonAsync("/shorten", new { fullUrl = "https://one.com", customAlias = "list-one" });
-        await client.PostAsJsonAsync("/shorten", new { fullUrl = "https://two.com", customAlias = "list-two" });
-
-        var response = await client.GetAsync("/urls");
-
-        response.StatusCode.Should().Be(HttpStatusCode.OK);
-        var body = await response.Content.ReadFromJsonAsync<List<UrlListItem>>();
-        body!.Should().Contain(u => u.Alias == "list-one");
-        body.Should().Contain(u => u.Alias == "list-two");
-    }
-
-    // --- DELETE /{alias} ---
-
-    [Fact]
-    public async Task Delete_Alias_ExistingAlias_Returns204()
-    {
-        var client = CreateClient();
-        await client.PostAsJsonAsync("/shorten", new { fullUrl = "https://example.com", customAlias = "del-me" });
-
-        var response = await client.DeleteAsync("/del-me");
-
-        response.StatusCode.Should().Be(HttpStatusCode.NoContent);
+        (await _client.GetAsync($"/urls?{query}")).StatusCode.Should().Be(HttpStatusCode.BadRequest);
     }
 
     [Fact]
-    public async Task Delete_Alias_ThenGet_Returns404()
+    public async Task Health_Returns200()
     {
-        var client = CreateClient();
-        await client.PostAsJsonAsync("/shorten", new { fullUrl = "https://example.com", customAlias = "gone" });
-
-        await client.DeleteAsync("/gone");
-        var getResponse = await client.GetAsync("/gone");
-
-        getResponse.StatusCode.Should().Be(HttpStatusCode.NotFound);
-    }
-
-    [Fact]
-    public async Task Delete_Alias_UnknownAlias_Returns404()
-    {
-        var client = CreateClient();
-
-        var response = await client.DeleteAsync("/nobody");
-
-        response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+        (await _client.GetAsync("/health")).StatusCode.Should().Be(HttpStatusCode.OK);
     }
 }

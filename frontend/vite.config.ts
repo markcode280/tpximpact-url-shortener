@@ -8,6 +8,7 @@ export default defineConfig({
     proxy: {
       '/shorten': 'http://localhost:8080',
       '/urls': 'http://localhost:8080',
+      '/health': 'http://localhost:8080',
       '^/[a-zA-Z0-9-]{2,64}$': 'http://localhost:8080',
     },
   },

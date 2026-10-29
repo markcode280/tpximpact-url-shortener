@@ -1,113 +1,137 @@
-## Coding Assessment Tasks
+# Snip — URL shortener
 
-### Intro
-This is a URL shortener that has been created by a junior engineer. Your task is to review the solution, check that it works and find any errors they may have made as well as complete the fixes and TODOs listed below.
+A small full-stack URL shortener using ASP.NET Core 8, EF Core and SQLite, with a React/TypeScript interface. Create automatic or custom aliases, follow redirects, browse links newest first, and delete links permanently.
 
-This solution has been pre-seeded with data in the database already.
+## Run with Docker
 
-Note that these are not necessarily in the order you will need to address them.
+Requires Docker Engine/Desktop and the Docker Compose v2 plugin.
 
-### Fixes
-
-- **Fix Delete Behaviour:** The client has reported strange behaviour whenc clicking on delete on a URL, investigate and fix the issue
-- **Generate Alias:** Implement the ```generateAlias``` function
-- **UI Implementation:** Build out the UI to display the URLs on the main page
-
-### TODO
-
-- Add paging for for the retrieval of the URLs
-- Sort URLs by their creation date
-- Create the Docker commands to run the solution
-- Replace this ReadMe with an appropriate one
-
----
-
-
-# Snip – URL Shortener
-
-A full-stack URL shortener built with **C# / ASP.NET Core 8** (backend) and **React + TypeScript** (frontend), containerised with Docker.
-
----
-
-## Architecture
-
-```
-frontend/      React + TypeScript (Vite)
-backend/
-  UrlShortener.Api/      ASP.NET Core 8 Web API + SQLite (EF Core)
-  UrlShortener.Tests/    xUnit unit + integration tests
-docker-compose.yml       Orchestrates both services
+```sh
+docker compose up --build --detach --wait
 ```
 
-The frontend proxies API calls through Nginx in production, so there are no CORS concerns once containerised. In development, Vite's dev server proxies to the local API.
+Open **http://localhost:3000**. Only the frontend is published, on loopback; Nginx proxies requests to the API over the Compose network. Both image builds run their respective test suites. Health checks wait for the database and proxy to become available.
 
----
+```sh
+bash scripts/smoke-test.sh
+docker compose logs --follow
+docker compose down
+```
 
-## API reference
+The named `url-data` volume preserves SQLite data across container restarts and `docker compose down`. To use a different public origin, change `PublicBaseUrl` and the frontend port binding in `docker-compose.yml` together. For an HTTPS deployment set `PublicBaseUrl` to the external HTTPS origin.
 
-The API matches the provided `openapi.yaml` contract exactly.
+The exercise brief mentions pre-seeded data, but the source repository contains no database or seed routine. A fresh installation therefore starts empty; create links through the form. Existing database rows are retained.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/shorten` | Create a shortened URL |
-| `GET` | `/urls` | List all shortened URLs |
-| `GET` | `/{alias}` | Redirect to the full URL |
-| `DELETE` | `/{alias}` | Delete a shortened URL |
+## Run locally
 
-### POST /shorten
+Requires the **.NET 8 SDK**, **Node.js 24 LTS** (or Node 22.12+) and npm. Run these from the repository root in two terminals:
+
+```sh
+dotnet run --project backend/UrlShortener.Api --urls http://localhost:8080
+```
+
+```sh
+cd frontend
+npm ci
+npm run dev
+```
+
+Open **http://localhost:3000**. Vite proxies API and alias requests to port 8080. Short links use the incoming request origin, so links created through the browser point back to port 3000. The frontend displays ten links per page.
+
+SQLite is created automatically. `DatabasePath` defaults to `urlshortener.db` relative to the API's working directory. For a custom path, ensure its parent directory exists and is writable by the API process.
+
+| Configuration | Purpose |
+| --- | --- |
+| `DatabasePath` | SQLite file path; Compose uses `/data/urlshortener.db` |
+| `PublicBaseUrl` | Optional external HTTP(S) origin for generated links, e.g. `https://snip.example.com`; otherwise use request scheme/host |
+| `AllowedOrigins` | CORS allowlist for separate-origin clients; same-origin Vite/Nginx proxying does not require CORS |
+| `ASPNETCORE_ENVIRONMENT` | Set to `Development` to enable `/swagger` |
+| `ASPNETCORE_URLS` | API listening address; Docker uses port 8080 |
+
+## Build and test
+
+From the repository root:
+
+```sh
+dotnet test backend/UrlShortener.sln -c Release
+dotnet publish backend/UrlShortener.Api -c Release -o artifacts/api
+```
+
+From `frontend`:
+
+```sh
+npm ci
+npm test
+npm run build
+npm audit
+```
+
+Backend service and HTTP integration tests use real SQLite in memory, including its unique constraints. Each test has an isolated database. Tests cover creation, validation, alias collisions (including a race at save time), ordering, pagination, redirects and deletion across contexts. Frontend tests cover the table, validation, API requests, loading/retry, pagination, stale requests, failed mutations and clipboard failures.
+
+The GitHub Actions workflow runs backend and frontend checks plus a Docker Compose build and HTTP smoke test on pushes and pull requests.
+
+## API
+
+| Method | Path | Success |
+| --- | --- | --- |
+| `POST` | `/shorten` | `201`, JSON link and `Location` header |
+| `GET` | `/urls?page=1&pageSize=10` | `200`, paginated JSON |
+| `GET` | `/{alias}` | `302`, `Location` points to destination |
+| `DELETE` | `/{alias}` | `204`, removal saved before responding |
+| `GET` | `/health` | `200` when SQLite is reachable, otherwise `503` |
+
+Create a link:
+
+```sh
+curl -i http://localhost:3000/shorten \
+  -H 'Content-Type: application/json' \
+  -d '{"fullUrl":"https://example.com/long/path","customAlias":"example-link"}'
+```
 
 ```json
-// Request
 {
-  "fullUrl": "https://example.com/very/long/path",
-  "customAlias": "my-alias"   // optional
-}
-
-// Response 201
-{
-  "alias": "my-alias",
-  "fullUrl": "https://example.com/very/long/path",
-  "shortUrl": "http://localhost:8080/my-alias"
+  "shortUrl": "http://localhost:3000/example-link",
+  "alias": "example-link",
+  "fullUrl": "https://example.com/long/path"
 }
 ```
 
-Returns `400` if the URL is invalid, the alias is malformed, or the alias is already taken.
+Omit `customAlias` (or leave it blank) for an eight-character random alias. Custom aliases are case-sensitive, contain 2–64 ASCII letters, numbers or hyphens, and cannot be application routes: `urls`, `shorten`, `health`, `swagger`, `assets` (reserved case-insensitively). Destinations must be absolute HTTP(S) URLs, without embedded credentials, up to 2048 characters.
 
-### GET /urls
+Invalid input, a reserved alias, an existing custom alias, or invalid pagination returns `400` with `{ "error": "..." }`. Duplicate aliases retain `400` to follow the original exercise contract. Exhausting five automatic-alias attempts returns `503`; unexpected errors return a generic `500` and are logged server-side. Missing redirect/deletion aliases return `404`. Redirects are temporary because links can be deleted; permanent browser caching would bypass that behaviour.
+
+Pagination response:
 
 ```json
-// Response 200
-[
-  {
-    "alias": "my-alias",
-    "fullUrl": "https://example.com/very/long/path",
-    "shortUrl": "http://localhost:8080/my-alias"
-  }
-]
+{
+  "items": [
+    {
+      "alias": "example-link",
+      "fullUrl": "https://example.com/long/path",
+      "shortUrl": "http://localhost:3000/example-link",
+      "createdAt": "2026-10-29T10:00:00Z"
+    }
+  ],
+  "page": 1,
+  "pageSize": 10,
+  "totalCount": 1,
+  "totalPages": 1
+}
 ```
 
-### GET /{alias}
+Pages are one-based; page size defaults to 10 and is limited to 1–100. Results are ordered by UTC creation date descending, then ID descending to break timestamp ties. A valid page beyond the end returns empty `items` with the requested page and current counts. An empty database has zero total pages. The UI returns to the last available page after a deletion removes a page.
 
-Returns `302 Redirect` to the full URL, or `404` if the alias doesn't exist.
+**Contract change:** `/urls` now returns a page envelope instead of the original array. The supplied React client has been updated with it. There is no `openapi.yaml` in the source repository; Swagger is generated from the API instead.
 
-### DELETE /{alias}
+## Design and scope
 
-Returns `204 No Content` on success, `404` if alias not found.
+- The existing controller/service/EF separation and React custom hook are retained. The application does not need an additional state library.
+- Aliases use cryptographic randomness over 62 characters. The database unique index protects against concurrent collisions; automatic generation retries up to five times. Aliases are identifiers, not authentication secrets.
+- `Skip`/`Take` runs in SQLite, with a creation-date/ID index for ordering. Offset pagination supports page numbers, but inserts between requests can move records between pages. A cursor would suit a larger, rapidly changing dataset.
+- Deletion is saved before success is returned. The frontend reloads page/count data after mutations and cancels stale list requests.
+- Failed submissions retain form input. Load failures show an error and retry control rather than an empty-list message.
+- The API runs as a non-root user in Docker with a persistent data volume. The frontend serves static assets; Node and test tools stay in the build stage.
 
----
+This is an exercise/demo application with an intentionally shared, unauthenticated link list. Before exposing it publicly, add ownership/authentication, authorisation for deletion, rate limits and abuse controls, trusted-host/TLS configuration, operational monitoring, backups and schema migrations. Do not store private or credential-bearing destination URLs. `EnsureCreated` is appropriate for a fresh exercise database; it does not migrate an existing schema or add new indexes to it.
 
-## Design decisions & assumptions
-
-**Persistence** — SQLite via EF Core. Zero-dependency, file-based, and entirely sufficient for this exercise. The database file path is configurable via `DatabasePath` in `appsettings.json` or an environment variable, and is volume-mounted in Docker so data survives container restarts.
-
-**Alias validation** — Aliases must be 2–64 characters, containing only letters, numbers, and hyphens. This mirrors typical URL shortener conventions and avoids characters that are awkward in URLs.
-
-**Random alias generation** — 
-
-**Error handling** — A global exception middleware catches unhandled exceptions and returns a clean JSON `{ "error": "..." }` envelope. Domain errors (duplicate alias, invalid input) are surfaced as typed exceptions from the service layer, translated to 400s in the controller.
-
-**Testing** — The backend has both unit tests (service layer, in-memory EF) and integration tests (`WebApplicationFactory` + in-memory EF, full HTTP stack). The frontend has component tests (React Testing Library) and service layer tests (mocked fetch).
-
-**Frontend** — Intentionally lightweight: a custom hook (`useUrlShortener`) owns all state and API interaction; components are purely presentational. No external state management library is needed at this scale.
-
-**CORS** — Allowed origins are configured in `appsettings.json`. In the Docker Compose setup, the Nginx reverse proxy means the frontend and API appear on the same origin to the browser, so CORS is only relevant in local development.
+See [change notes](docs/CHANGES.md) for the fixes and design decisions, and [validation results](docs/VALIDATION.md) for checks performed and remaining verification.

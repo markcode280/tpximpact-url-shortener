@@ -5,62 +5,57 @@ using UrlShortener.Api.Services;
 namespace UrlShortener.Api.Controllers;
 
 [ApiController]
-public class UrlsController : ControllerBase
+public class UrlsController(IUrlShortenerService service, IConfiguration configuration) : ControllerBase
 {
-    private readonly IUrlShortenerService _service;
-    private readonly ILogger<UrlsController> _logger;
-
-    public UrlsController(IUrlShortenerService service, ILogger<UrlsController> logger)
-    {
-        _service = service;
-        _logger = logger;
-    }
-
-    // POST /shorten
     [HttpPost("shorten")]
-    public async Task<IActionResult> Shorten([FromBody] ShortenUrlRequest request)
-    {        
-                            return Ok();
-    }
-
-    // GET /urls
-    [HttpGet("urls")]
-    [ProducesResponseType(typeof(IEnumerable<UrlListItem>), StatusCodes.Status200OK)]
-    public async Task<IActionResult> GetAll()
+    [ProducesResponseType(typeof(ShortenUrlResponse), StatusCodes.Status201Created)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
+    public async Task<IActionResult> Shorten([FromBody] ShortenUrlRequest request, CancellationToken cancellationToken)
     {
-        var baseUrl = GetBaseUrl();
-        var urls = await _service.GetAllAsync(baseUrl);
-        return Ok(urls);
+        try
+        {
+            var result = await service.ShortenAsync(request, GetBaseUrl(), cancellationToken);
+            return Created(result.ShortUrl, result);
+        }
+        catch (ArgumentException ex) { return BadRequest(new { error = ex.Message }); }
+        catch (AliasConflictException ex) { return BadRequest(new { error = ex.Message }); }
+        catch (AliasGenerationException ex)
+        {
+            return StatusCode(StatusCodes.Status503ServiceUnavailable, new { error = ex.Message });
+        }
     }
 
-    // GET /{alias}  — redirect
+    [HttpGet("urls")]
+    [ProducesResponseType(typeof(PagedUrls), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> GetPage([FromQuery] PaginationQuery query, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return Ok(await service.GetPageAsync(GetBaseUrl(), query.Page, query.PageSize, cancellationToken));
+        }
+        catch (ArgumentException ex) { return BadRequest(new { error = ex.Message }); }
+    }
+
     [HttpGet("{alias}")]
     [ProducesResponseType(StatusCodes.Status302Found)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public async Task<IActionResult> RedirectToUrl(string alias)
+    public async Task<IActionResult> RedirectToUrl(string alias, CancellationToken cancellationToken)
     {
-        var fullUrl = await _service.GetFullUrlAsync(alias);
-        if (fullUrl is null)
-            return NotFound(new { error = $"No URL found for alias '{alias}'." });
-
-        return Redirect(fullUrl);
+        var fullUrl = await service.GetFullUrlAsync(alias, cancellationToken);
+        return fullUrl is null ? NotFound(new { error = $"No URL found for alias '{alias}'." }) : Redirect(fullUrl);
     }
 
-    // DELETE /{alias}
     [HttpDelete("{alias}")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public async Task<IActionResult> Delete(string alias)
+    public async Task<IActionResult> Delete(string alias, CancellationToken cancellationToken)
     {
-        var deleted = await _service.DeleteAsync(alias);
-        if (!deleted)
-            return NotFound(new { error = $"No URL found for alias '{alias}'." });
-
-        return NoContent();
+        var deleted = await service.DeleteAsync(alias, cancellationToken);
+        return deleted ? NoContent() : NotFound(new { error = $"No URL found for alias '{alias}'." });
     }
 
-    private string GetBaseUrl()
-    {
-        return $"{Request.Scheme}://{Request.Host}";
-    }
+    private string GetBaseUrl() => configuration["PublicBaseUrl"]?.TrimEnd('/')
+        ?? $"{Request.Scheme}://{Request.Host}{Request.PathBase}";
 }

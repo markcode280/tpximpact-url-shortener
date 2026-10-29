@@ -15,8 +15,11 @@ public class AppDbContext : DbContext
         {
             entity.HasKey(e => e.Id);
             entity.HasIndex(e => e.Alias).IsUnique();
-            entity.Property(e => e.Alias).IsRequired().HasMaxLength(128);
+            entity.Property(e => e.Alias).IsRequired().HasMaxLength(64);
             entity.Property(e => e.FullUrl).IsRequired().HasMaxLength(2048);
+            entity.Property(e => e.CreatedAt).HasConversion(
+                value => value, value => DateTime.SpecifyKind(value, DateTimeKind.Utc));
+            entity.HasIndex(e => new { e.CreatedAt, e.Id });
         });
     }
 }

@@ -56,4 +56,24 @@ describe('ShortenForm', () => {
     fireEvent.click(screen.getByRole('button', { name: /shorten url/i }));
     await waitFor(() => expect(urlInput).toHaveValue(''));
   });
+
+  it('keeps input and explains a failed server submission', async () => {
+    const onSubmit = vi.fn().mockRejectedValue(new Error('This alias is reserved.'));
+    render(<ShortenForm onSubmit={onSubmit} />);
+    await userEvent.type(screen.getByLabelText(/long url/i), 'https://example.com');
+    await userEvent.type(screen.getByLabelText(/custom alias/i), 'urls');
+    await userEvent.click(screen.getByRole('button', { name: /shorten url/i }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('This alias is reserved.');
+    expect(screen.getByLabelText(/long url/i)).toHaveValue('https://example.com');
+    expect(screen.getByLabelText(/custom alias/i)).toHaveValue('urls');
+  });
+
+  it('rejects non-HTTP destinations before sending them', async () => {
+    const onSubmit = vi.fn();
+    render(<ShortenForm onSubmit={onSubmit} />);
+    await userEvent.type(screen.getByLabelText(/long url/i), 'ftp://example.com');
+    await userEvent.click(screen.getByRole('button', { name: /shorten url/i }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('HTTP or HTTPS');
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
 });

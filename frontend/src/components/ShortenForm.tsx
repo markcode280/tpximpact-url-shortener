@@ -15,11 +15,28 @@ export function ShortenForm({ onSubmit, disabled }: ShortenFormProps) {
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setValidationError(null);
+    const url = fullUrl.trim();
+    const alias = customAlias.trim();
+    if (!url) { setValidationError('URL is required.'); return; }
+    try {
+      const parsed = new URL(url);
+      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || url.length > 2048)
+        throw new Error();
+    } catch {
+      setValidationError('Enter a valid URL using HTTP or HTTPS, without credentials (maximum 2048 characters).');
+      return;
+    }
+    if (alias && !/^[a-zA-Z0-9-]{2,64}$/.test(alias)) {
+      setValidationError('Alias may only contain letters, numbers, and hyphens (2–64 characters).');
+      return;
+    }
     setSubmitting(true);
     try {
-      await onSubmit(fullUrl.trim(), customAlias.trim() || undefined);
+      await onSubmit(url, alias || undefined);
       setFullUrl('');
       setCustomAlias('');
+    } catch (error) {
+      setValidationError(error instanceof Error ? error.message : 'Failed to shorten URL.');
     } finally {
       setSubmitting(false);
     }
@@ -37,6 +54,7 @@ export function ShortenForm({ onSubmit, disabled }: ShortenFormProps) {
           onChange={(e) => setFullUrl(e.target.value)}
           disabled={disabled || submitting}
           aria-required="true"
+          required
           aria-describedby={validationError ? 'form-error' : undefined}
         />
       </div>
@@ -52,7 +70,9 @@ export function ShortenForm({ onSubmit, disabled }: ShortenFormProps) {
           value={customAlias}
           onChange={(e) => setCustomAlias(e.target.value)}
           disabled={disabled || submitting}
+          aria-describedby="alias-hint"
         />
+        <small id="alias-hint">2–64 letters, numbers or hyphens. Leave blank for an automatic alias.</small>
       </div>
 
       {validationError && (

@@ -3,3 +3,6 @@
 **/.vs/
 **/.idea/
 **/TestResults/
+**/*.db
+**/*.db-shm
+**/*.db-wal

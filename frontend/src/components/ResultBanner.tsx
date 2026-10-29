@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ShortenUrlResponse } from '../types/api';
 
 interface ResultBannerProps {
@@ -8,11 +8,21 @@ interface ResultBannerProps {
 
 export function ResultBanner({ result, onDismiss }: ResultBannerProps) {
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState(false);
+
+  useEffect(() => { setCopied(false); setCopyError(false); }, [result.shortUrl]);
+  useEffect(() => {
+    if (!copied) return;
+    const timeout = setTimeout(() => setCopied(false), 2000);
+    return () => clearTimeout(timeout);
+  }, [copied]);
 
   const copy = async () => {
-    await navigator.clipboard.writeText(result.shortUrl);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    try {
+      await navigator.clipboard.writeText(result.shortUrl);
+      setCopied(true);
+      setCopyError(false);
+    } catch { setCopyError(true); }
   };
 
   return (
@@ -28,6 +38,7 @@ export function ResultBanner({ result, onDismiss }: ResultBannerProps) {
           >
             {result.shortUrl}
           </a>
+          {copyError && <span role="alert">Could not copy. Select and copy the link manually.</span>}
         </div>
         <div className="result-banner__actions">
           <button className="btn-secondary" onClick={copy} aria-label="Copy short URL">

@@ -20,14 +20,18 @@ public class GlobalExceptionMiddleware
         {
             await _next(context);
         }
-        catch (Exception ex)
+        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+        {
+            // The client disconnected; there is no response to send.
+        }
+        catch (Exception ex) when (!context.Response.HasStarted)
         {
             _logger.LogError(ex, "Unhandled exception for {Method} {Path}", context.Request.Method, context.Request.Path);
-            await WriteErrorResponseAsync(context, ex);
+            await WriteErrorResponseAsync(context);
         }
     }
 
-    private static async Task WriteErrorResponseAsync(HttpContext context, Exception ex)
+    private static async Task WriteErrorResponseAsync(HttpContext context)
     {
         context.Response.ContentType = "application/json";
         context.Response.StatusCode = (int)HttpStatusCode.InternalServerError;

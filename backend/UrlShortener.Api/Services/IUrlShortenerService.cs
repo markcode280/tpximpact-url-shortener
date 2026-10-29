@@ -4,8 +4,8 @@ namespace UrlShortener.Api.Services;
 
 public interface IUrlShortenerService
 {
-    Task<ShortenUrlResponse> ShortenAsync(ShortenUrlRequest request, string baseUrl);
-    Task<string?> GetFullUrlAsync(string alias);
-    Task<IEnumerable<UrlListItem>> GetAllAsync(string baseUrl);
-    Task<bool> DeleteAsync(string alias);
+    Task<ShortenUrlResponse> ShortenAsync(ShortenUrlRequest request, string baseUrl, CancellationToken cancellationToken = default);
+    Task<string?> GetFullUrlAsync(string alias, CancellationToken cancellationToken = default);
+    Task<PagedUrls> GetPageAsync(string baseUrl, int page = 1, int pageSize = 10, CancellationToken cancellationToken = default);
+    Task<bool> DeleteAsync(string alias, CancellationToken cancellationToken = default);
 }
